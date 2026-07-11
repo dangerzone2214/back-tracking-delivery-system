@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: back-tracking-api
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm run db:init && npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: back-tracking-db
+          property: connectionString
+      - key: GOOGLE_SHEETS_API_KEY
+        sync: false
+      - key: AUTH_SECRET
+        generateValue: true
+      - key: CORS_ORIGIN
+        value: "*"
+
+  - type: web
+    name: back-tracking-web
+    runtime: static
+    buildCommand: ""
+    staticPublishPath: frontend
+    routes:
+      - type: rewrite
+        source: /
+        destination: /delivery-tracker.html
+      - type: rewrite
+        source: /admin
+        destination: /delivery-tracker.html
+      - type: rewrite
+        source: /agent
+        destination: /agent.html
+
+databases:
+  - name: back-tracking-db
+    databaseName: back_tracking
+    user: back_tracking_user

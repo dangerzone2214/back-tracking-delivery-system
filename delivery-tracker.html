@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="tl">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101417" />
+    <title>Back Tracking & Delivery Reporting System</title>
+    <link rel="stylesheet" href="delivery-tracker.css" />
+    <script src="config.js"></script>
+    <script defer src="delivery-tracker.js"></script>
+  </head>
+  <body class="light">
+    <section class="admin-login-screen" id="adminLoginScreen">
+      <div class="admin-login-card">
+        <p class="eyebrow">Admin access only</p>
+        <h1>Back Tracking</h1>
+        <p class="login-copy">Login as admin bago makita ang dashboard at reports.</p>
+        <label>
+          Admin Username
+          <input id="adminUsername" autocomplete="username" />
+        </label>
+        <label>
+          Password
+          <input id="adminPassword" type="password" autocomplete="current-password" />
+        </label>
+        <button id="adminLoginBtn" type="button">Login</button>
+        <p class="source-note" id="adminLoginNote">Admin account required.</p>
+      </div>
+    </section>
+
+    <main class="app hidden" id="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <p class="eyebrow">Google Sheets source of truth</p>
+          <h1>Back Tracking</h1>
+        </div>
+        <nav id="nav">
+          <button class="active" data-view="dashboard" type="button">Dashboard</button>
+          <button data-view="sheets" type="button">Annual Google Sheets</button>
+          <button data-view="sync" type="button">Synchronization</button>
+          <button data-view="search" type="button">Customer History</button>
+          <button data-view="products" type="button">Product Reports</button>
+          <button data-view="reports" type="button">Reports</button>
+          <button data-view="settings" type="button">Settings</button>
+          <a href="agent.html">Agent Portal</a>
+        </nav>
+      </aside>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="pageKicker">Real-time delivery overview</p>
+            <h2 id="pageTitle">Dashboard</h2>
+          </div>
+          <div class="top-actions">
+            <div class="admin-auth" id="adminAuth">
+              <span id="adminCurrentUser">Admin</span>
+              <button class="secondary danger hidden" id="adminLogoutBtn" type="button">Logout</button>
+            </div>
+            <button class="secondary" id="themeBtn" type="button">Light Mode</button>
+            <button id="syncAllBtn" type="button">Refresh Sync</button>
+          </div>
+        </header>
+
+        <section class="view active" data-panel="dashboard">
+          <div class="filters">
+            <label>Year <select id="dashboardYear"></select></label>
+            <label>Month <select id="dashboardMonth"></select></label>
+            <label>Status <select id="dashboardStatus"></select></label>
+          </div>
+          <div class="metrics" id="metrics"></div>
+          <div class="dashboard-grid">
+            <section class="panel">
+              <div class="section-head">
+                <h3>Delivery Status</h3>
+                <span id="statusChartLabel">0 records</span>
+              </div>
+              <canvas id="statusChart" width="620" height="300"></canvas>
+            </section>
+            <section class="panel">
+              <div class="section-head">
+                <h3>Monthly Volume</h3>
+                <span id="trendLabel">Current year</span>
+              </div>
+              <canvas id="trendChart" width="620" height="300"></canvas>
+            </section>
+          </div>
+          <section class="panel">
+            <div class="section-head">
+              <h3>Recent Records</h3>
+              <span id="recentCount">Latest synchronized rows</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Customer</th>
+                    <th>CP Number</th>
+                    <th>Tracking</th>
+                    <th>Brand Name</th>
+                    <th>Amount</th>
+                    <th>Status</th>
+                    <th>Sheet</th>
+                  </tr>
+                </thead>
+                <tbody id="recentBody"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" data-panel="sheets">
+          <section class="panel">
+            <div class="section-head">
+              <div>
+                <h3>Annual Google Sheet Management</h3>
+                <span>Paste the normal Google Sheet edit link per month</span>
+              </div>
+              <div class="inline-actions">
+                <label class="compact-label">Year <input id="sheetYear" type="number" min="2020" max="2099" /></label>
+                <button class="secondary" id="loadYearBtn" type="button">Refresh</button>
+                <button id="saveSheetsBtn" type="button">Save</button>
+              </div>
+            </div>
+            <p class="sheet-help" id="sheetHelp">Paste the normal Google Sheet link, like /spreadsheets/d/.../edit?gid=0. For real connection, deploy this app to Netlify and set GOOGLE_SHEETS_API_KEY.</p>
+            <div class="month-grid" id="monthGrid"></div>
+          </section>
+        </section>
+
+        <section class="view" data-panel="sync">
+          <section class="panel">
+            <div class="section-head">
+              <div>
+                <h3>Synchronization Monitor</h3>
+                <span id="syncSummary">Google Sheets to internal IndexedDB</span>
+              </div>
+              <button id="syncVisibleYearBtn" type="button">Sync Selected Year</button>
+            </div>
+            <div class="sync-list" id="syncList"></div>
+          </section>
+        </section>
+
+        <section class="view" data-panel="search">
+          <div class="search-box">
+            <label>
+              Search receiver cellphone, waybill number, receiver, remarks
+              <input id="searchInput" placeholder="Search one or many: CP, waybill, receiver" />
+            </label>
+            <button id="searchBtn" type="button">Search</button>
+          </div>
+          <div class="metrics compact" id="customerMetrics"></div>
+          <div class="risk-banner hidden" id="rtsWarning"></div>
+          <section class="panel">
+            <div class="section-head">
+              <h3>Customer History</h3>
+              <span id="searchCount">0 records</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Creator Code</th>
+                    <th>Waybill Number</th>
+                    <th>Order Status</th>
+                    <th>SigningTime</th>
+                    <th>Receiver</th>
+                    <th>Receiver Cellphone</th>
+                    <th>Submission Time</th>
+                    <th>Remarks</th>
+                    <th>Sender Name</th>
+                  </tr>
+                </thead>
+                <tbody id="searchBody"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" data-panel="products">
+          <section class="panel">
+            <div class="section-head">
+              <h3>Product Analytics</h3>
+              <span id="productCount">Top products by volume and amount</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Product</th>
+                    <th>Orders</th>
+                    <th>Delivered</th>
+                    <th>Returned</th>
+                    <th>Total Amount</th>
+                  </tr>
+                </thead>
+                <tbody id="productBody"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" data-panel="reports">
+          <section class="panel">
+            <div class="section-head">
+              <h3>Exports and Reports</h3>
+              <span>Filtered data comes from the synchronized database</span>
+            </div>
+            <div class="action-grid">
+              <button id="exportCsvBtn" type="button">Download CSV</button>
+              <button id="printReportBtn" type="button">Print / Save PDF</button>
+              <button class="secondary" id="backupBtn" type="button">Backup Settings</button>
+              <label class="upload-button">
+                Restore Settings
+                <input id="restoreInput" type="file" accept=".json" />
+              </label>
+              <button class="secondary danger" id="clearDbBtn" type="button">Clear Sync Database</button>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" data-panel="settings">
+          <section class="panel">
+            <div class="section-head">
+              <h3>System Settings</h3>
+              <span id="dbStatus">IndexedDB internal database</span>
+            </div>
+            <div class="settings-grid" id="settingsGrid"></div>
+          </section>
+          <section class="panel">
+            <div class="section-head">
+              <h3>Agent Accounts</h3>
+              <span id="agentAccountCount">Backend accounts</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Username</th>
+                    <th>Role</th>
+                    <th>Status</th>
+                    <th>Login Count</th>
+                    <th>Last Login</th>
+                    <th>Created</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="agentAccountsBody"></tbody>
+              </table>
+            </div>
+          </section>
+          <section class="panel">
+            <div class="section-head">
+              <h3>Agent Login Activity</h3>
+              <span id="agentLoginCount">Latest 100 logins</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Username</th>
+                    <th>Role</th>
+                    <th>Login Time</th>
+                    <th>IP Address</th>
+                  </tr>
+                </thead>
+                <tbody id="agentLoginsBody"></tbody>
+              </table>
+            </div>
+          </section>
+          <section class="panel">
+            <div class="section-head">
+              <h3>Activity Logs</h3>
+              <button class="secondary" id="clearLogsBtn" type="button">Clear Logs</button>
+            </div>
+            <div class="logs" id="logs"></div>
+          </section>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>

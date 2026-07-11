@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="tl">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Portal | Back Tracking</title>
+    <link rel="stylesheet" href="agent.css" />
+    <script src="config.js"></script>
+    <script defer src="agent.js"></script>
+  </head>
+  <body>
+    <section class="agent-login-screen" id="loginScreen">
+      <div class="agent-login-card">
+        <p class="eyebrow">Agent lookup portal</p>
+        <h1>Back Tracking</h1>
+        <p class="login-copy" id="authCopy">Login muna bago makita ang agent search portal.</p>
+
+        <div class="auth-tabs" role="tablist" aria-label="Agent account options">
+          <button class="active" id="showLoginBtn" type="button">Login</button>
+          <button id="showRegisterBtn" type="button">Register</button>
+        </div>
+
+        <label>
+          Username
+          <input id="usernameInput" autocomplete="username" />
+        </label>
+        <label>
+          Password
+          <input id="passwordInput" type="password" autocomplete="current-password" />
+        </label>
+        <label class="hidden" id="confirmPasswordLabel">
+          Confirm Password
+          <input id="confirmPasswordInput" type="password" autocomplete="new-password" />
+        </label>
+        <button id="loginBtn" type="button">Login</button>
+        <button class="hidden" id="registerBtn" type="button">Create Account</button>
+        <p class="source-note" id="loginNote">Login using your assigned agent account.</p>
+      </div>
+    </section>
+
+    <main class="agent-app hidden" id="agentApp">
+      <header class="agent-header">
+        <div>
+          <p class="eyebrow">Agent lookup portal</p>
+          <h1>Back Tracking</h1>
+        </div>
+        <button class="hidden" id="logoutBtn" type="button">Logout</button>
+      </header>
+
+      <section class="search-panel">
+        <label>
+          Search receiver cellphone, waybill number, receiver, remarks
+          <input id="searchInput" autocomplete="off" placeholder="Search one or many: CP, waybill, receiver" />
+        </label>
+        <button id="searchBtn" type="button">Search</button>
+      </section>
+
+      <section class="metrics" id="metrics"></section>
+      <section class="risk-banner hidden" id="rtsWarning"></section>
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>Customer History</h2>
+          <span id="resultCount">0 records</span>
+        </div>
+        <p class="source-note" id="sourceNote">Reading local synced data.</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Creator Code</th>
+                <th>Waybill Number</th>
+                <th>Order Status</th>
+                <th>SigningTime</th>
+                <th>Receiver</th>
+                <th>Receiver Cellphone</th>
+                <th>Submission Time</th>
+                <th>Remarks</th>
+                <th>Sender Name</th>
+              </tr>
+            </thead>
+            <tbody id="resultsBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
