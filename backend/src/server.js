@@ -21,7 +21,14 @@ let autoSyncRunning = false;
 let lastAutoSyncAt = 0;
 
 app.use(helmet());
-app.use(cors({ origin: corsOrigins.includes("*") ? "*" : corsOrigins }));
+const corsOptions = {
+  origin: corsOrigins.includes("*") ? "*" : corsOrigins,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-File-Name"],
+  maxAge: 86400,
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "250mb" }));
 
 app.get("/health", (_req, res) => {
