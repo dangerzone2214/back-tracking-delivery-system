@@ -28,6 +28,7 @@ const COLORS = {
 };
 
 let db;
+const selectedExcelFiles = new Map();
 let state = {
   view: "dashboard",
   settings: loadSettings(),
@@ -104,12 +105,17 @@ async function init() {
   document.body.classList.toggle("light", state.settings.theme === "light");
   els.themeBtn.textContent = state.settings.theme === "light" ? "Dark Mode" : "Light Mode";
   if (location.protocol === "file:" && els.sheetHelp) {
-    els.sheetHelp.textContent = "Local file preview is for checking the dashboard only. Normal Google Sheet links connect after deploying to Netlify with GOOGLE_SHEETS_API_KEY.";
+    els.sheetHelp.textContent = "Local file preview is for checking the dashboard only. Excel import works after connecting the Render backend.";
   }
   setupStaticSelects();
   bindEvents();
   applyAdminAuthState();
   await refreshAll();
+  if (API_BASE) {
+    setInterval(() => {
+      if (state.adminToken && state.adminUser?.role === "admin") renderDashboard();
+    }, 120000);
+  }
 }
 
 function defaultSettings() {
@@ -209,7 +215,13 @@ async function backendRequest(path, options = {}) {
     },
   });
   const text = await response.text();
-  const payload = text ? JSON.parse(text) : null;
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    const clean = text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 220);
+    throw new Error(clean || `Backend returned HTTP ${response.status}.`);
+  }
   if (!response.ok) throw new Error(payload?.error || "Backend request failed.");
   return payload;
 }
@@ -391,7 +403,7 @@ function switchView(view) {
   els.nav.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
   const titles = {
     dashboard: ["Real-time delivery overview", "Dashboard"],
-    sheets: ["Annual management", "Annual Google Sheets"],
+    sheets: ["Monthly file and sheet import", "Data Import"],
     sync: ["Never display outdated information", "Synchronization"],
     search: ["Fast record lookup", "Customer History"],
     products: ["Product performance", "Product Reports"],
@@ -428,7 +440,9 @@ function renderSheetManager(year) {
   els.monthGrid.innerHTML = MONTHS.map((month, index) => {
     const number = index + 1;
     const item = sheets[number];
-    const dot = item.url ? (item.imported ? "ok" : "warn") : "bad";
+    const selectedFile = selectedExcelFiles.get(fileKey(year, number));
+    const hasSource = item.url || item.excelFile;
+    const dot = hasSource ? (item.imported ? "ok" : "warn") : "bad";
     return `
       <article class="month-card" data-month-card="${number}">
         <header>
@@ -438,9 +452,12 @@ function renderSheetManager(year) {
           </div>
           <i class="status-dot ${dot}"></i>
         </header>
-        <label>Google Sheet URL <input data-sheet-url="${number}" value="${escapeAttr(item.url || "")}" placeholder="Paste Google Sheet link" /></label>
+        <label>Excel File <input data-excel-file="${number}" type="file" accept=".xlsx,.xls,.csv" /></label>
+        <span>${selectedFile ? `Selected: ${escapeHtml(selectedFile.name)}` : item.excelFile ? `Last Excel: ${escapeHtml(item.excelFile)}` : "No Excel selected"}</span>
+        <label>Google Sheet URL <input data-sheet-url="${number}" value="${escapeAttr(item.url || "")}" placeholder="Optional Google Sheet link" /></label>
         <span>Last Sync: ${item.lastSync ? new Date(item.lastSync).toLocaleString() : "Never"} | Records: ${numberFormat(item.imported || 0)}</span>
         <div class="month-actions">
+          <button data-import-excel="${number}" type="button">Import Excel</button>
           <button class="secondary" data-test-month="${number}" type="button">Test</button>
           <button data-sync-month="${number}" type="button">Sync</button>
           <button class="secondary danger" data-remove-month="${number}" type="button">Remove</button>
@@ -449,9 +466,77 @@ function renderSheetManager(year) {
     `;
   }).join("");
 
+  els.monthGrid.querySelectorAll("[data-excel-file]").forEach((input) => input.addEventListener("change", () => {
+    const month = Number(input.dataset.excelFile);
+    const file = input.files?.[0];
+    if (file) {
+      selectedExcelFiles.set(fileKey(year, month), file);
+      renderSheetManager(year);
+    }
+  }));
+  els.monthGrid.querySelectorAll("[data-import-excel]").forEach((button) => button.addEventListener("click", () => importExcelMonth(Number(els.sheetYear.value), Number(button.dataset.importExcel))));
   els.monthGrid.querySelectorAll("[data-test-month]").forEach((button) => button.addEventListener("click", () => testMonth(Number(els.sheetYear.value), Number(button.dataset.testMonth))));
   els.monthGrid.querySelectorAll("[data-sync-month]").forEach((button) => button.addEventListener("click", () => syncMonth(Number(els.sheetYear.value), Number(button.dataset.syncMonth))));
   els.monthGrid.querySelectorAll("[data-remove-month]").forEach((button) => button.addEventListener("click", () => removeMonth(Number(els.sheetYear.value), Number(button.dataset.removeMonth))));
+}
+
+async function importExcelMonth(year, month) {
+  if (!API_BASE) {
+    alert("Excel import needs the Render backend connection.");
+    return;
+  }
+  const input = els.monthGrid.querySelector(`[data-excel-file="${month}"]`);
+  const key = fileKey(year, month);
+  const file = selectedExcelFiles.get(key) || input?.files?.[0];
+  if (!file) {
+    alert("Choose an Excel or CSV file first, then click Import Excel on the same month.");
+    return;
+  }
+  updateMonthStatus(year, month, { status: "Uploading Excel..." });
+  try {
+    const result = await uploadExcelInChunks(year, month, file);
+    updateMonthStatus(year, month, {
+      url: "",
+      excelFile: file.name,
+      status: "Imported",
+      sheetName: result.sheetName || file.name,
+      lastSync: new Date().toISOString(),
+      imported: result.importedRecords || 0,
+    });
+    addLog(`Imported ${numberFormat(result.importedRecords || 0)} rows from ${file.name}`);
+    selectedExcelFiles.delete(key);
+    await refreshAll();
+  } catch (error) {
+    updateMonthStatus(year, month, { status: `Import failed: ${error.message}` });
+  }
+}
+
+function fileKey(year, month) {
+  return `${year}-${month}`;
+}
+
+async function uploadExcelInChunks(year, month, file) {
+  const uploadId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const chunkSize = 5 * 1024 * 1024;
+  const chunkTotal = Math.ceil(file.size / chunkSize);
+  let result = null;
+  for (let index = 0; index < chunkTotal; index += 1) {
+    const start = index * chunkSize;
+    const chunk = file.slice(start, Math.min(file.size, start + chunkSize));
+    updateMonthStatus(year, month, { status: `Uploading Excel ${index + 1}/${chunkTotal}...` });
+    result = await backendRequest(`/api/import-chunk/${year}/${month}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-File-Name": encodeURIComponent(file.name),
+        "X-Upload-Id": uploadId,
+        "X-Chunk-Index": String(index),
+        "X-Chunk-Total": String(chunkTotal),
+      },
+      body: chunk,
+    });
+  }
+  return result;
 }
 
 async function saveSheetInputs() {
@@ -499,25 +584,13 @@ async function testMonth(year, month) {
 
 async function syncYear(year) {
   await saveSheetInputs();
-  if (API_BASE) {
-    try {
-      updateAllMonthStatuses(year, "Syncing via backend...");
-      await backendRequest(`/api/sync/${year}`, { method: "POST" });
-      addLog(`Backend synced year ${year}`);
-      await refreshAll();
-      return;
-    } catch (error) {
-      alert(error.message);
-      renderAll();
-      return;
-    }
-  }
   const sheets = ensureYear(year);
   const months = Object.keys(sheets).filter((month) => sheets[month].url);
   if (!months.length) {
     alert("No Google Sheet links saved for this year.");
     return;
   }
+  updateAllMonthStatuses(year, API_BASE ? "Syncing via backend/local browser..." : "Syncing...");
   for (const month of months) {
     await syncMonth(year, Number(month), true);
   }
@@ -543,13 +616,33 @@ async function syncMonth(year, month, quiet = false) {
       addLog(`Backend synced ${MONTHS[month - 1]} ${year}`);
       return;
     } catch (error) {
-      updateMonthStatus(year, month, { status: `Sync failed: ${error.message}` });
-      return;
+      updateMonthStatus(year, month, { status: `Backend failed, reading locally...` });
+      try {
+        const rows = await readRowsFromGoogleSheet(item.url);
+        const result = await backendRequest(`/api/import-rows/${year}/${month}`, {
+          method: "POST",
+          body: JSON.stringify({
+            source: item.url,
+            sheetName: extractSheetName(item.url) || `${MONTHS[month - 1]} Google Sheet`,
+            rows,
+          }),
+        });
+        updateMonthStatus(year, month, {
+          status: "Synced",
+          sheetName: result.sheetName || extractSheetName(item.url) || `${MONTHS[month - 1]} Sheet`,
+          lastSync: new Date().toISOString(),
+          imported: result.importedRecords || rows.length,
+        });
+        addLog(`Local browser synced ${numberFormat(result.importedRecords || rows.length)} records for ${MONTHS[month - 1]} ${year}`);
+        return;
+      } catch (fallbackError) {
+        updateMonthStatus(year, month, { status: `Sync failed: ${fallbackError.message}` });
+        return;
+      }
     }
   }
   try {
-    const text = await fetchSheetCsv(item.url);
-    const rows = parseCsv(text);
+    const rows = await readRowsFromGoogleSheet(item.url);
     const sheetKey = `${year}-${String(month).padStart(2, "0")}`;
     const records = rows.map((row, index) => normalizeRecord(row, { year, month, sheetKey, sourceUrl: item.url, rowNumber: index + 2 })).filter(Boolean);
     await replaceSheetRecords(sheetKey, records);
@@ -564,6 +657,13 @@ async function syncMonth(year, month, quiet = false) {
   } catch (error) {
     updateMonthStatus(year, month, { status: `Sync failed: ${error.message}` });
   }
+}
+
+async function readRowsFromGoogleSheet(url) {
+  const text = await fetchSheetCsv(url);
+  const rows = parseCsv(text);
+  if (!rows.length) throw new Error("No readable rows found in this Google Sheet.");
+  return rows;
 }
 
 async function removeMonth(year, month) {
@@ -594,7 +694,7 @@ function updateMonthStatus(year, month, patch) {
 function updateAllMonthStatuses(year, status) {
   const sheets = ensureYear(year);
   Object.keys(sheets).forEach((month) => {
-    if (sheets[month].url) sheets[month].status = status;
+    if (sheets[month].url || sheets[month].excelFile) sheets[month].status = status;
   });
   saveSettings();
   renderSheetManager(year);
@@ -975,6 +1075,10 @@ function filteredDashboardRecords() {
 }
 
 function renderDashboard() {
+  if (API_BASE && state.adminToken && state.adminUser?.role === "admin") {
+    renderBackendDashboard();
+    return;
+  }
   const records = filteredDashboardRecords();
   state.dashboardRecords = records;
   const summary = summarize(records);
@@ -990,7 +1094,38 @@ function renderDashboard() {
   els.trendLabel.textContent = `${els.dashboardYear.value}`;
   drawStatusChart(els.statusChart, summary.counts);
   drawTrendChart(els.trendChart, state.records.filter((record) => record.year === Number(els.dashboardYear.value)));
-  els.recentBody.innerHTML = records.slice().sort((a, b) => b.orderDate.localeCompare(a.orderDate)).slice(0, 80).map(rowHtml).join("") || emptyRow(8, "No synchronized records yet.");
+  els.recentBody.innerHTML = records.slice().sort((a, b) => b.orderDate.localeCompare(a.orderDate)).slice(0, 80).map(recentRowHtml).join("") || emptyRow(8, "No synchronized records yet.");
+}
+
+async function renderBackendDashboard() {
+  try {
+    const query = new URLSearchParams({
+      year: String(els.dashboardYear.value || state.settings.currentYear),
+      month: String(els.dashboardMonth.value || 0),
+      status: els.dashboardStatus.value || "",
+    });
+    const payload = await backendRequest(`/api/dashboard?${query.toString()}`);
+    const summary = payload.summary || {};
+    const counts = Object.fromEntries(Object.keys(STATUS).map((key) => [key, 0]));
+    (payload.statusCounts || []).forEach((item) => {
+      counts[item.status || "other"] = Number(item.total) || 0;
+    });
+    els.metrics.innerHTML = [
+      ["Total Records", numberFormat(summary.total)],
+      ["Delivered", numberFormat(summary.delivered)],
+      ["Returns", numberFormat(summary.rts)],
+      ["Delivery Rate", `${Number(summary.deliveryRate) || 0}%`],
+      ["Total Amount", peso(summary.amount)],
+      ["Last Sync", "Auto"],
+    ].map(metricCard).join("");
+    els.statusChartLabel.textContent = `${numberFormat(summary.total)} records`;
+    els.trendLabel.textContent = `${payload.year} | auto-sync every ${payload.autoSync?.intervalMinutes || 5} min`;
+    drawStatusChart(els.statusChart, counts);
+    drawMonthlyCounts(els.trendChart, payload.monthly || []);
+    els.recentBody.innerHTML = (payload.recent || []).map(recentRowHtml).join("") || emptyRow(8, "No synchronized records yet.");
+  } catch (error) {
+    els.recentBody.innerHTML = emptyRow(8, escapeHtml(error.message || "Backend dashboard failed."));
+  }
 }
 
 function summarize(records) {
@@ -1076,6 +1211,44 @@ function drawTrendChart(canvas, records) {
   });
 }
 
+function drawMonthlyCounts(canvas, monthlyRows) {
+  const { ctx, width, height } = setupCanvas(canvas);
+  const counts = Array.from({ length: 12 }, () => 0);
+  monthlyRows.forEach((row) => counts[Number(row.month) - 1] = Number(row.total) || 0);
+  if (!counts.some(Boolean)) return drawEmpty(ctx, width, height);
+  const max = Math.max(1, ...counts);
+  const left = 38;
+  const bottom = height - 40;
+  const step = (width - left - 20) / 11;
+  ctx.strokeStyle = "rgba(140,150,145,.35)";
+  ctx.beginPath();
+  ctx.moveTo(left, 18);
+  ctx.lineTo(left, bottom);
+  ctx.lineTo(width - 12, bottom);
+  ctx.stroke();
+  ctx.strokeStyle = COLORS.delivered;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  counts.forEach((value, index) => {
+    const x = left + index * step;
+    const y = bottom - (value / max) * (height - 78);
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  counts.forEach((value, index) => {
+    const x = left + index * step;
+    const y = bottom - (value / max) * (height - 78);
+    ctx.fillStyle = COLORS.delivered;
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = getComputedStyle(document.body).getPropertyValue("--muted");
+    ctx.font = "11px Segoe UI";
+    ctx.fillText(MONTHS[index].slice(0, 3), x - 10, height - 14);
+  });
+}
+
 function setupCanvas(canvas) {
   const scale = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
@@ -1096,12 +1269,12 @@ function drawEmpty(ctx, width, height) {
 function renderSyncList() {
   const year = Number(els.sheetYear.value || state.settings.currentYear);
   const sheets = ensureYear(year);
-  const linked = Object.values(sheets).filter((item) => item.url).length;
+  const linked = Object.values(sheets).filter((item) => item.url || item.excelFile).length;
   const imported = Object.values(sheets).reduce((sum, item) => sum + (Number(item.imported) || 0), 0);
-  els.syncSummary.textContent = `${linked} linked sheets | ${numberFormat(imported)} imported records`;
+  els.syncSummary.textContent = `${linked} data sources | ${numberFormat(imported)} imported records`;
   els.syncList.innerHTML = MONTHS.map((month, index) => {
     const item = sheets[index + 1];
-    const dot = item.url ? (item.imported ? "ok" : "warn") : "bad";
+    const dot = (item.url || item.excelFile) ? (item.imported ? "ok" : "warn") : "bad";
     return `
       <article class="sync-item">
         <div>
@@ -1395,6 +1568,15 @@ function dateTimeLabel(value) {
   return value ? new Date(value).toLocaleString() : "-";
 }
 
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || "").split(",")[1] || "");
+    reader.onerror = () => reject(reader.error || new Error("Unable to read file."));
+    reader.readAsDataURL(file);
+  });
+}
+
 function rowHtml(record) {
   const status = record.status || record.normalized_status || "other";
   const orderStatus = record.orderStatus || record.order_status || record.statusText || record.statusLabel || STATUS[status] || "-";
@@ -1409,6 +1591,23 @@ function rowHtml(record) {
       <td>${escapeHtml(record.submissionTime || record.submission_time || "-")}</td>
       <td>${escapeHtml(record.remarks || record.product || "-")}</td>
       <td>${escapeHtml(record.senderName || record.sender_name || record.courier || "-")}</td>
+    </tr>
+  `;
+}
+
+function recentRowHtml(record) {
+  const status = record.status || record.normalized_status || "other";
+  const orderStatus = record.orderStatus || record.order_status || record.statusText || record.statusLabel || STATUS[status] || "-";
+  return `
+    <tr>
+      <td>${escapeHtml(record.orderDate || record.order_date || record.signingTime || record.signing_time || "-")}</td>
+      <td>${escapeHtml(record.receiver || record.customer || record.customerName || "-")}</td>
+      <td>${escapeHtml(record.receiverCellphone || record.receiver_cellphone || record.mobile || record.phone || "-")}</td>
+      <td>${escapeHtml(record.waybillNumber || record.waybill_number || record.tracking || record.trackingNumber || "-")}</td>
+      <td>${escapeHtml(brandName(record.remarks || record.product || "-"))}</td>
+      <td>${peso(record.amount)}</td>
+      <td><span class="badge ${status}">${escapeHtml(orderStatus)}</span></td>
+      <td>${escapeHtml(record.sheetKey || record.sheet_key || `${record.year || ""}-${String(record.month || "").padStart(2, "0")}`)}</td>
     </tr>
   `;
 }
