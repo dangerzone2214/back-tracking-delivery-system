@@ -1,8 +1,9 @@
 export async function readGoogleSheetRows(sheetUrl) {
   const { id, gid } = sheetParts(sheetUrl);
+  const apiKey = validApiKey(process.env.GOOGLE_SHEETS_API_KEY);
 
-  if (process.env.GOOGLE_SHEETS_API_KEY) {
-    return readViaSheetsApi(id, gid, process.env.GOOGLE_SHEETS_API_KEY);
+  if (apiKey) {
+    return readViaSheetsApi(id, gid, apiKey);
   }
 
   const csvUrl = toCsvUrl(sheetUrl);
@@ -13,7 +14,7 @@ export async function readGoogleSheetRows(sheetUrl) {
   if (!response.ok) throw new Error(`Google Sheet returned HTTP ${response.status}`);
   const text = await response.text();
   if (!text.trim() || text.trim().startsWith("<!doctype")) {
-    throw new Error("Sheet is not readable. Add GOOGLE_SHEETS_API_KEY or make the Sheet public viewer.");
+    throw new Error("Sheet is not readable. Make the Sheet public viewer or publish it as CSV.");
   }
 
   return parseCsv(text);
@@ -117,4 +118,11 @@ function findHeaderRowIndex(rows) {
 
 function headerKey(value) {
   return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function validApiKey(value) {
+  const key = String(value || "").trim();
+  if (!key) return "";
+  if (["not-set-yet", "none", "null", "undefined", "no-api"].includes(key.toLowerCase())) return "";
+  return key;
 }
