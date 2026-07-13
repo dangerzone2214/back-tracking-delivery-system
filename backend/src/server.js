@@ -19,12 +19,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const autoSyncIntervalMs = Math.max(1, Number(process.env.AUTO_SYNC_INTERVAL_MINUTES || 5)) * 60 * 1000;
 let autoSyncRunning = false;
 let lastAutoSyncAt = 0;
+const uploadSessions = new Map();
 
 app.use(helmet());
 const corsOptions = {
   origin: corsOrigins.includes("*") ? "*" : corsOrigins,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-File-Name"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-File-Name", "X-Upload-Id", "X-Chunk-Index", "X-Chunk-Total"],
   maxAge: 86400,
 };
 app.use(cors(corsOptions));
@@ -233,6 +234,28 @@ app.post("/api/import/:year/:month", requireAdminAuth, async (req, res, next) =>
   }
 });
 
+app.post("/api/import-rows/:year/:month", requireAdminAuth, async (req, res, next) => {
+  try {
+    const year = Number(req.params.year);
+    const month = Number(req.params.month);
+    const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
+    const source = String(req.body.source || `browser-google:${year}-${month}`).slice(0, 400);
+    const sheetName = String(req.body.sheetName || "Google Sheet").slice(0, 180);
+    if (!year || !month || month < 1 || month > 12) return res.status(400).json({ error: "Valid year and month are required." });
+    if (!rows.length) return res.status(400).json({ error: "No readable rows were received." });
+
+    const result = await importRows(year, month, rows, {
+      source,
+      sheetName,
+      status: "Synced",
+      filename: sheetName,
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/import-file/:year/:month", requireAdminAuth, express.raw({ type: "application/octet-stream", limit: "250mb" }), async (req, res, next) => {
   try {
     const year = Number(req.params.year);
@@ -244,6 +267,44 @@ app.post("/api/import-file/:year/:month", requireAdminAuth, express.raw({ type: 
     const { sheetName, rows } = readWorkbookRows(req.body, filename);
     const result = await importRows(year, month, rows, { sheetName, filename });
     res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/import-chunk/:year/:month", requireAdminAuth, express.raw({ type: "application/octet-stream", limit: "12mb" }), async (req, res, next) => {
+  try {
+    const year = Number(req.params.year);
+    const month = Number(req.params.month);
+    const uploadId = String(req.headers["x-upload-id"] || "");
+    const filename = decodeURIComponent(String(req.headers["x-file-name"] || `month-${month}.xlsx`)).slice(0, 180);
+    const chunkIndex = Number(req.headers["x-chunk-index"]);
+    const chunkTotal = Number(req.headers["x-chunk-total"]);
+    if (!year || !month || month < 1 || month > 12) return res.status(400).json({ error: "Valid year and month are required." });
+    if (!uploadId || !Number.isInteger(chunkIndex) || !Number.isInteger(chunkTotal) || chunkTotal < 1) {
+      return res.status(400).json({ error: "Valid upload chunk headers are required." });
+    }
+    if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: "Excel chunk is required." });
+
+    const key = `${req.user.id}:${year}:${month}:${uploadId}`;
+    const session = uploadSessions.get(key) || {
+      filename,
+      chunks: new Array(chunkTotal),
+      chunkTotal,
+      createdAt: Date.now(),
+    };
+    session.chunks[chunkIndex] = req.body;
+    uploadSessions.set(key, session);
+
+    const received = session.chunks.filter(Boolean).length;
+    if (received < chunkTotal) return res.json({ received, complete: false });
+
+    const buffer = Buffer.concat(session.chunks);
+    uploadSessions.delete(key);
+    cleanupUploadSessions();
+    const { sheetName, rows } = readWorkbookRows(buffer, filename);
+    const result = await importRows(year, month, rows, { sheetName, filename });
+    res.json({ ...result, received, complete: true });
   } catch (error) {
     next(error);
   }
@@ -403,6 +464,13 @@ async function recordLoginEvent(req, user) {
   );
 }
 
+function cleanupUploadSessions() {
+  const cutoff = Date.now() - 20 * 60 * 1000;
+  for (const [key, session] of uploadSessions.entries()) {
+    if (session.createdAt < cutoff) uploadSessions.delete(key);
+  }
+}
+
 async function autoSyncIfDue(year = 0) {
   const now = Date.now();
   if (autoSyncRunning || now - lastAutoSyncAt < autoSyncIntervalMs) return;
@@ -463,8 +531,8 @@ async function importRows(year, month, rows, meta) {
     .filter(Boolean);
 
   await persistMonthRecords(year, month, records, {
-    status: "Imported",
-    source: `excel:${meta.filename}`,
+    status: meta.status || "Imported",
+    source: meta.source || `excel:${meta.filename}`,
     sheetName: meta.sheetName || meta.filename,
   });
 
