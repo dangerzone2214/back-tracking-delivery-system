@@ -2,14 +2,23 @@ import "dotenv/config";
 import cors from "cors";
 import express from "express";
 import helmet from "helmet";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createToken, hashPassword, makeSalt, requireAdminAuth, requireAgentAuth, verifyPassword } from "./auth.js";
 import { query, withTransaction } from "./db.js";
+import { readWorkbookRows } from "./excel.js";
 import { readGoogleSheetRows } from "./sheets.js";
 import { brandName, digitsOnly, normalizeRecord, normalizeText } from "./normalize.js";
+import { seedAgentAccounts } from "./seed-agents.js";
 
 const app = express();
 const port = Number(process.env.PORT || 4000);
 const corsOrigins = (process.env.CORS_ORIGIN || "*").split(",").map((item) => item.trim());
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const autoSyncIntervalMs = Math.max(1, Number(process.env.AUTO_SYNC_INTERVAL_MINUTES || 5)) * 60 * 1000;
+let autoSyncRunning = false;
+let lastAutoSyncAt = 0;
 
 app.use(helmet());
 app.use(cors({ origin: corsOrigins.includes("*") ? "*" : corsOrigins }));
@@ -199,8 +208,43 @@ app.post("/api/sync/:year", requireAdminAuth, async (req, res, next) => {
   }
 });
 
+app.post("/api/import/:year/:month", requireAdminAuth, async (req, res, next) => {
+  try {
+    const year = Number(req.params.year);
+    const month = Number(req.params.month);
+    const filename = String(req.body.filename || `month-${month}.xlsx`).slice(0, 180);
+    const contentBase64 = String(req.body.contentBase64 || "");
+    if (!year || !month || month < 1 || month > 12) return res.status(400).json({ error: "Valid year and month are required." });
+    if (!contentBase64) return res.status(400).json({ error: "Excel file is required." });
+
+    const buffer = Buffer.from(contentBase64, "base64");
+    const { sheetName, rows } = readWorkbookRows(buffer, filename);
+    const result = await importRows(year, month, rows, { sheetName, filename });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/import-file/:year/:month", requireAdminAuth, express.raw({ type: "application/octet-stream", limit: "250mb" }), async (req, res, next) => {
+  try {
+    const year = Number(req.params.year);
+    const month = Number(req.params.month);
+    const filename = decodeURIComponent(String(req.headers["x-file-name"] || `month-${month}.xlsx`)).slice(0, 180);
+    if (!year || !month || month < 1 || month > 12) return res.status(400).json({ error: "Valid year and month are required." });
+    if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: "Excel file is required." });
+
+    const { sheetName, rows } = readWorkbookRows(req.body, filename);
+    const result = await importRows(year, month, rows, { sheetName, filename });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/search", requireAgentAuth, async (req, res, next) => {
   try {
+    await autoSyncIfDue();
     const terms = searchTerms(String(req.query.q || ""));
     if (!terms.length) return res.json({ total: 0, summary: emptySummary(), rows: [] });
     const clauses = [];
@@ -242,6 +286,7 @@ app.get("/api/search", requireAgentAuth, async (req, res, next) => {
 app.get("/api/dashboard", requireAdminAuth, async (req, res, next) => {
   try {
     const year = Number(req.query.year || new Date().getFullYear());
+    await autoSyncIfDue(year);
     const month = Number(req.query.month || 0);
     const status = String(req.query.status || "");
     const filters = ["year = $1"];
@@ -268,7 +313,27 @@ app.get("/api/dashboard", requireAdminAuth, async (req, res, next) => {
       `select month, count(*)::int total from delivery_records where year = $1 group by month order by month`,
       [year]
     );
-    res.json({ year, summary: makeSummary(summary.rows[0]), monthly: monthly.rows });
+    const statusCounts = await query(
+      `select normalized_status status, count(*)::int total
+       from delivery_records where ${where}
+       group by normalized_status`,
+      params
+    );
+    const recent = await query(
+      `select * from delivery_records
+       where ${where}
+       order by order_date desc nulls last, synced_at desc, row_number desc
+       limit 80`,
+      params
+    );
+    res.json({
+      year,
+      summary: makeSummary(summary.rows[0]),
+      monthly: monthly.rows,
+      statusCounts: statusCounts.rows,
+      recent: recent.rows,
+      autoSync: { intervalMinutes: Math.round(autoSyncIntervalMs / 60000), lastAutoSyncAt },
+    });
   } catch (error) {
     next(error);
   }
@@ -276,6 +341,7 @@ app.get("/api/dashboard", requireAdminAuth, async (req, res, next) => {
 
 app.get("/api/products", requireAdminAuth, async (_req, res, next) => {
   try {
+    await autoSyncIfDue();
     const result = await query("select remarks, normalized_status, amount from delivery_records");
     const map = new Map();
     for (const row of result.rows) {
@@ -299,28 +365,21 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ error: error.message || "Server error" });
 });
 
-app.listen(port, () => {
-  console.log(`Back Tracking API running on http://localhost:${port}`);
-});
-
-ensureRuntimeSchema().catch((error) => {
-  console.error("Runtime schema check failed", error);
-});
+ensureRuntimeSchema()
+  .then(() => {
+    app.listen(port, () => {
+      console.log(`Back Tracking API running on http://localhost:${port}`);
+    });
+  })
+  .catch((error) => {
+    console.error("Runtime schema check failed", error);
+    process.exit(1);
+  });
 
 async function ensureRuntimeSchema() {
-  await query(`
-    create table if not exists agent_login_events (
-      id bigserial primary key,
-      agent_id bigint references agent_accounts(id) on delete set null,
-      username text not null,
-      role text not null default 'agent',
-      ip_address text,
-      user_agent text,
-      logged_in_at timestamptz not null default now()
-    )
-  `);
-  await query("create index if not exists idx_agent_login_events_agent on agent_login_events (agent_id)");
-  await query("create index if not exists idx_agent_login_events_time on agent_login_events (logged_in_at desc)");
+  const schema = await fs.readFile(path.resolve(__dirname, "../schema.sql"), "utf8");
+  await query(schema);
+  await seedAgentAccounts();
 }
 
 async function recordLoginEvent(req, user) {
@@ -337,6 +396,43 @@ async function recordLoginEvent(req, user) {
   );
 }
 
+async function autoSyncIfDue(year = 0) {
+  const now = Date.now();
+  if (autoSyncRunning || now - lastAutoSyncAt < autoSyncIntervalMs) return;
+  autoSyncRunning = true;
+  lastAutoSyncAt = now;
+  try {
+    const params = [];
+    const filters = ["url like 'http%'"];
+    if (year) {
+      params.push(year);
+      filters.push(`year = $${params.length}`);
+    }
+    const links = await query(
+      `select year, month, url
+       from sheet_links
+       where ${filters.join(" and ")}
+       order by year desc, month asc
+       limit 36`,
+      params
+    );
+    for (const link of links.rows) {
+      try {
+        await syncMonth(link.year, link.month, link.url);
+      } catch (error) {
+        await query(
+          `update sheet_links
+           set status = $3, updated_at = now()
+           where year = $1 and month = $2`,
+          [link.year, link.month, `Auto-sync failed: ${String(error.message || error).slice(0, 180)}`]
+        );
+      }
+    }
+  } finally {
+    autoSyncRunning = false;
+  }
+}
+
 async function syncMonth(year, month, url) {
   const sheetKey = makeSheetKey(year, month);
   const rows = await readGoogleSheetRows(url);
@@ -344,6 +440,32 @@ async function syncMonth(year, month, url) {
     .map((row, index) => normalizeRecord(row, { year, month, sheetKey, rowNumber: index + 2 }))
     .filter(Boolean);
 
+  await persistMonthRecords(year, month, records, {
+    status: "Synced",
+    source: url,
+    sheetName: "Google Sheet",
+  });
+
+  return { year, month, sheetKey, importedRecords: records.length };
+}
+
+async function importRows(year, month, rows, meta) {
+  const sheetKey = makeSheetKey(year, month);
+  const records = rows
+    .map((row, index) => normalizeRecord(row, { year, month, sheetKey, rowNumber: index + 2 }))
+    .filter(Boolean);
+
+  await persistMonthRecords(year, month, records, {
+    status: "Imported",
+    source: `excel:${meta.filename}`,
+    sheetName: meta.sheetName || meta.filename,
+  });
+
+  return { year, month, sheetKey, importedRecords: records.length, sheetName: meta.sheetName };
+}
+
+async function persistMonthRecords(year, month, records, meta) {
+  const sheetKey = makeSheetKey(year, month);
   await withTransaction(async (client) => {
     await client.query("delete from delivery_records where sheet_key = $1", [sheetKey]);
     for (const record of records) {
@@ -380,14 +502,19 @@ async function syncMonth(year, month, url) {
       );
     }
     await client.query(
-      `update sheet_links
-       set status = 'Synced', last_sync = now(), imported_records = $3, updated_at = now()
-       where year = $1 and month = $2`,
-      [year, month, records.length]
+      `insert into sheet_links (year, month, url, sheet_name, status, last_sync, imported_records, updated_at)
+       values ($1, $2, $3, $4, $5, now(), $6, now())
+       on conflict (year, month)
+       do update set
+        url = excluded.url,
+        sheet_name = excluded.sheet_name,
+        status = excluded.status,
+        last_sync = now(),
+        imported_records = excluded.imported_records,
+        updated_at = now()`,
+      [year, month, meta.source, meta.sheetName, meta.status, records.length]
     );
   });
-
-  return { year, month, sheetKey, importedRecords: records.length };
 }
 
 function makeSheetKey(year, month) {
