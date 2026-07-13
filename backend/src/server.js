@@ -13,7 +13,7 @@ const corsOrigins = (process.env.CORS_ORIGIN || "*").split(",").map((item) => it
 
 app.use(helmet());
 app.use(cors({ origin: corsOrigins.includes("*") ? "*" : corsOrigins }));
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "250mb" }));
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "Back Tracking API" });
